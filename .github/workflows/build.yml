@@ -1,0 +1,226 @@
+name: Build
+
+on:
+  push:
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_COMPILERCHECK: content
+  CCACHE_NOHASHDIR: "true"
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,pch_defines
+
+jobs:
+  android:
+    name: Android (arm64-v8a)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          validate-wrappers: false
+          cache-read-only: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: android-${{ hashFiles('.gitmodules', 'android/app/build.gradle') }}
+          max-size: 500M
+
+      - name: Select NDK and CMake
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          NDK_DIR="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          if [ -n "$NDK_DIR" ] && [ -f "$NDK_DIR/source.properties" ]; then
+            NDK_VERSION="$(basename "$NDK_DIR")"
+          else
+            NDK_VERSION="27.2.12479018"
+            yes | "$SDKMANAGER" --licenses > /dev/null || true
+            "$SDKMANAGER" --install "ndk;$NDK_VERSION"
+          fi
+          if [ ! -d "$ANDROID_HOME/cmake/3.22.1" ]; then
+            yes | "$SDKMANAGER" --licenses > /dev/null || true
+            "$SDKMANAGER" --install "cmake;3.22.1"
+          fi
+          echo "NDK $NDK_VERSION"
+          echo "SMB_NDK_VERSION=$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        working-directory: android
+        env:
+          SMB_VERSION: ${{ inputs.version }}
+        run: |
+          chmod +x gradlew
+          VERSION_ARGS=()
+          if [ -n "$SMB_VERSION" ]; then
+            VERSION_ARGS=(-PsmbVersionName="${SMB_VERSION#v}" -PsmbVersionCode="${{ github.run_number }}")
+          fi
+          ./gradlew assembleRelease -PsmbNdkVersion="$SMB_NDK_VERSION" "${VERSION_ARGS[@]}" --build-cache --parallel --stacktrace
+          ccache --show-stats
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SuperMarioBros3-Android
+          path: android/app/build/outputs/apk/release/*.apk
+          compression-level: 0
+
+  windows:
+    name: Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          variant: sccache
+          key: windows-${{ hashFiles('.gitmodules') }}
+          max-size: 500M
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+
+      - name: Build
+        run: |
+          cmake --build build
+          sccache --show-stats
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SuperMarioBros3-Windows
+          path: build/SuperMarioBros3.exe
+
+  linux:
+    name: Linux (x64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: ninja-build libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols libegl1-mesa-dev libgl1-mesa-dev libasound2-dev libpulse-dev libudev-dev libdbus-1-dev
+          version: 1.0
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: linux-${{ hashFiles('.gitmodules') }}
+          max-size: 500M
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: |
+          cmake --build build
+          ccache --show-stats
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SuperMarioBros3-Linux
+          path: build/SuperMarioBros3
+
+  macos:
+    name: macOS (Universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: macos-${{ hashFiles('.gitmodules') }}
+          max-size: 500M
+
+      - name: Configure
+        env:
+          SMB_VERSION: ${{ inputs.version }}
+        run: |
+          VERSION="${SMB_VERSION#v}"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DSMB_VERSION="${VERSION:-1.0.0}" -DSMB_BUILD_NUMBER="${{ github.run_number }}"
+
+      - name: Build
+        run: |
+          cmake --build build --parallel "$(sysctl -n hw.ncpu)"
+          ccache --show-stats
+
+      - name: Package
+        run: |
+          codesign --force --deep --sign - build/SuperMarioBros3.app
+          ditto -c -k --keepParent build/SuperMarioBros3.app SuperMarioBros3-macOS.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SuperMarioBros3-macOS
+          path: SuperMarioBros3-macOS.zip
+          compression-level: 0
+
+  ios:
+    name: iOS (arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        env:
+          SMB_VERSION: ${{ inputs.version }}
+        run: |
+          VERSION="${SMB_VERSION#v}"
+          cmake -S . -B build-ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DSMB_COMPILER_CACHE=OFF \
+            -DPython3_EXECUTABLE="$(command -v python3)" \
+            -DSMB_VERSION="${VERSION:-1.0.0}" -DSMB_BUILD_NUMBER="${{ github.run_number }}"
+
+      - name: Build
+        run: |
+          cmake --build build-ios --config Release -- -sdk iphoneos -quiet \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Package IPA
+        run: |
+          APP="$(find build-ios -type d -name 'SuperMarioBros3.app' -path '*Release-iphoneos*' | head -n 1)"
+          test -n "$APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qr -9 SuperMarioBros3-iOS.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SuperMarioBros3-iOS
+          path: SuperMarioBros3-iOS.ipa
+          compression-level: 0

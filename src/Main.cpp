@@ -1,0 +1,840 @@
+#include <SDL.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#if defined(__ANDROID__)
+#include <jni.h>
+#endif
+
+#if defined(__IPHONEOS__)
+#include "IosPlatform.hpp"
+#endif
+
+#include "AudioOutput.hpp"
+#include "Controller.hpp"
+#include "Draw.hpp"
+#include "FramePacer.hpp"
+#include "Game.hpp"
+#include "TouchControls.hpp"
+
+namespace
+{
+const char* kRomName = "baserom.nes";
+const int kSampleRate = 48000;
+
+#if defined(__ANDROID__) || defined(__IPHONEOS__)
+const bool kMobile = true;
+#else
+const bool kMobile = false;
+#endif
+
+bool fileExists(const std::string& path)
+{
+    SDL_RWops* file = SDL_RWFromFile(path.c_str(), "rb");
+    if (!file)
+    {
+        return false;
+    }
+    SDL_RWclose(file);
+    return true;
+}
+
+std::string storageDirectory()
+{
+#if defined(__ANDROID__)
+    const char* internal = SDL_AndroidGetInternalStoragePath();
+    return internal ? std::string(internal) + "/" : std::string();
+#else
+    char* pref = SDL_GetPrefPath("BrenninhoTools", "SuperMarioBros3");
+    std::string result = pref ? pref : "";
+    SDL_free(pref);
+    return result;
+#endif
+}
+
+std::vector<std::string> romCandidates(int argc, char** argv)
+{
+    std::vector<std::string> paths;
+    if (argc > 1)
+    {
+        paths.push_back(argv[1]);
+    }
+    paths.push_back(storageDirectory() + kRomName);
+#if defined(__IPHONEOS__)
+    paths.push_back(smb3::iosDocumentsDirectory() + kRomName);
+#endif
+#if !defined(__ANDROID__) && !defined(__IPHONEOS__)
+    char* base = SDL_GetBasePath();
+    if (base)
+    {
+        paths.push_back(std::string(base) + kRomName);
+        SDL_free(base);
+    }
+    paths.push_back(kRomName);
+#endif
+    return paths;
+}
+
+bool copyFile(const std::string& from, const std::string& to)
+{
+    SDL_RWops* in = SDL_RWFromFile(from.c_str(), "rb");
+    if (!in)
+    {
+        return false;
+    }
+    Sint64 size = SDL_RWsize(in);
+    if (size <= 0 || size > 4 * 1024 * 1024)
+    {
+        SDL_RWclose(in);
+        return false;
+    }
+    std::vector<uint8_t> data((size_t)size);
+    size_t read = SDL_RWread(in, data.data(), 1, data.size());
+    SDL_RWclose(in);
+    if (read != data.size())
+    {
+        return false;
+    }
+    SDL_RWops* out = SDL_RWFromFile(to.c_str(), "wb");
+    if (!out)
+    {
+        return false;
+    }
+    size_t written = SDL_RWwrite(out, data.data(), 1, data.size());
+    SDL_RWclose(out);
+    return written == data.size();
+}
+
+void requestRomPicker(SDL_Window* window)
+{
+#if defined(__ANDROID__)
+    JNIEnv* env = (JNIEnv*)SDL_AndroidGetJNIEnv();
+    jobject activity = (jobject)SDL_AndroidGetActivity();
+    if (!env || !activity)
+    {
+        return;
+    }
+    jclass cls = env->GetObjectClass(activity);
+    jmethodID method = env->GetMethodID(cls, "requestRom", "()V");
+    if (method)
+    {
+        env->CallVoidMethod(activity, method);
+    }
+    if (env->ExceptionCheck())
+    {
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(cls);
+    env->DeleteLocalRef(activity);
+#elif defined(__IPHONEOS__)
+    smb3::iosRequestRom(window, storageDirectory() + kRomName);
+#else
+    (void)window;
+#endif
+}
+
+struct Input
+{
+    std::vector<SDL_GameController*> controllers;
+    double lastPadTime = -1000.0;
+
+    void open(int index)
+    {
+        if (!SDL_IsGameController(index))
+        {
+            return;
+        }
+        SDL_GameController* controller = SDL_GameControllerOpen(index);
+        if (controller)
+        {
+            controllers.push_back(controller);
+        }
+    }
+
+    void close(SDL_JoystickID id)
+    {
+        for (auto it = controllers.begin(); it != controllers.end(); ++it)
+        {
+            if (SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(*it)) == id)
+            {
+                SDL_GameControllerClose(*it);
+                controllers.erase(it);
+                return;
+            }
+        }
+    }
+
+    static uint8_t readController(SDL_GameController* controller)
+    {
+        uint8_t buttons = 0;
+        auto pressed = [&](SDL_GameControllerButton b) { return SDL_GameControllerGetButton(controller, b) != 0; };
+        if (pressed(SDL_CONTROLLER_BUTTON_A))
+        {
+            buttons |= smb3::ButtonA;
+        }
+        if (pressed(SDL_CONTROLLER_BUTTON_B) || pressed(SDL_CONTROLLER_BUTTON_X))
+        {
+            buttons |= smb3::ButtonB;
+        }
+        if (pressed(SDL_CONTROLLER_BUTTON_Y))
+        {
+            buttons |= smb3::ButtonA;
+        }
+        if (pressed(SDL_CONTROLLER_BUTTON_START))
+        {
+            buttons |= smb3::ButtonStart;
+        }
+        if (pressed(SDL_CONTROLLER_BUTTON_BACK))
+        {
+            buttons |= smb3::ButtonSelect;
+        }
+        if (pressed(SDL_CONTROLLER_BUTTON_DPAD_UP))
+        {
+            buttons |= smb3::ButtonUp;
+        }
+        if (pressed(SDL_CONTROLLER_BUTTON_DPAD_DOWN))
+        {
+            buttons |= smb3::ButtonDown;
+        }
+        if (pressed(SDL_CONTROLLER_BUTTON_DPAD_LEFT))
+        {
+            buttons |= smb3::ButtonLeft;
+        }
+        if (pressed(SDL_CONTROLLER_BUTTON_DPAD_RIGHT))
+        {
+            buttons |= smb3::ButtonRight;
+        }
+        const Sint16 dead = 12000;
+        Sint16 ax = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTX);
+        Sint16 ay = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTY);
+        if (ax < -dead)
+        {
+            buttons |= smb3::ButtonLeft;
+        }
+        if (ax > dead)
+        {
+            buttons |= smb3::ButtonRight;
+        }
+        if (ay < -dead)
+        {
+            buttons |= smb3::ButtonUp;
+        }
+        if (ay > dead)
+        {
+            buttons |= smb3::ButtonDown;
+        }
+        return buttons;
+    }
+
+    static uint8_t readKeyboard()
+    {
+        const Uint8* keys = SDL_GetKeyboardState(nullptr);
+        uint8_t buttons = 0;
+        if (keys[SDL_SCANCODE_X] || keys[SDL_SCANCODE_K] || keys[SDL_SCANCODE_SPACE])
+        {
+            buttons |= smb3::ButtonA;
+        }
+        if (keys[SDL_SCANCODE_Z] || keys[SDL_SCANCODE_J] || keys[SDL_SCANCODE_LSHIFT])
+        {
+            buttons |= smb3::ButtonB;
+        }
+        if (keys[SDL_SCANCODE_RETURN])
+        {
+            buttons |= smb3::ButtonStart;
+        }
+        if (keys[SDL_SCANCODE_RSHIFT] || keys[SDL_SCANCODE_BACKSPACE] || keys[SDL_SCANCODE_TAB])
+        {
+            buttons |= smb3::ButtonSelect;
+        }
+        if (keys[SDL_SCANCODE_UP] || keys[SDL_SCANCODE_W])
+        {
+            buttons |= smb3::ButtonUp;
+        }
+        if (keys[SDL_SCANCODE_DOWN] || keys[SDL_SCANCODE_S])
+        {
+            buttons |= smb3::ButtonDown;
+        }
+        if (keys[SDL_SCANCODE_LEFT] || keys[SDL_SCANCODE_A])
+        {
+            buttons |= smb3::ButtonLeft;
+        }
+        if (keys[SDL_SCANCODE_RIGHT] || keys[SDL_SCANCODE_D])
+        {
+            buttons |= smb3::ButtonRight;
+        }
+        return buttons;
+    }
+};
+
+int displayRefreshRate(SDL_Window* window)
+{
+    int index = SDL_GetWindowDisplayIndex(window);
+    SDL_DisplayMode mode = {};
+    if (index >= 0 && SDL_GetCurrentDisplayMode(index, &mode) == 0 && mode.refresh_rate > 0)
+    {
+        return mode.refresh_rate;
+    }
+    return 60;
+}
+
+struct PerformanceStats
+{
+    bool visible = false;
+    double windowTime = 0.0;
+    int windowFrames = 0;
+    int windowPresents = 0;
+    double windowWork = 0.0;
+    double gameFps = 0.0;
+    double presentFps = 0.0;
+    double workMs = 0.0;
+
+    void update(double elapsed, int frames, double work)
+    {
+        windowTime += elapsed;
+        windowFrames += frames;
+        windowPresents++;
+        windowWork += work;
+        if (windowTime >= 0.5)
+        {
+            gameFps = windowFrames / windowTime;
+            presentFps = windowPresents / windowTime;
+            workMs = windowFrames ? windowWork * 1000.0 / windowFrames : 0.0;
+            windowTime = windowWork = 0.0;
+            windowFrames = windowPresents = 0;
+        }
+    }
+
+    void draw(SDL_Renderer* renderer, const smb3::FramePacer& pacer, const smb3::AudioOutput& audio, int outputHeight) const
+    {
+        if (!visible)
+        {
+            return;
+        }
+        int scale = std::max(1, outputHeight / 360);
+        char lines[4][96];
+        std::snprintf(lines[0], sizeof(lines[0]), "GAME %.1f FPS  DISPLAY %.1f FPS", gameFps, presentFps);
+        std::snprintf(lines[1], sizeof(lines[1]), "FRAME %.2f MS", workMs);
+        if (pacer.locked())
+        {
+            std::snprintf(lines[2], sizeof(lines[2]), "VSYNC LOCK %dHZ / %d", pacer.refreshRate(), pacer.interval());
+        }
+        else
+        {
+            std::snprintf(lines[2], sizeof(lines[2]), "TIMER %dHZ", pacer.refreshRate());
+        }
+        std::snprintf(lines[3], sizeof(lines[3]), "AUDIO %d HZ  QUEUE %.1f MS", audio.sampleRate(),
+                      audio.sampleRate() ? audio.queuedSamples() * 1000.0 / audio.sampleRate() : 0.0);
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 170);
+        SDL_Rect panel = {4 * scale, 4 * scale, 220 * scale, 46 * scale};
+        SDL_RenderFillRect(renderer, &panel);
+        for (int i = 0; i < 4; i++)
+        {
+            smb3::drawText(renderer, lines[i], 8 * scale, (8 + i * 10) * scale, scale, {120, 255, 120, 255}, false);
+        }
+    }
+};
+
+bool loadFillSetting()
+{
+    SDL_RWops* file = SDL_RWFromFile((storageDirectory() + "settings.cfg").c_str(), "rb");
+    if (!file)
+    {
+        return true;
+    }
+    char buffer[256] = {};
+    size_t read = SDL_RWread(file, buffer, 1, sizeof(buffer) - 1);
+    SDL_RWclose(file);
+    std::string text(buffer, read);
+    return text.find("fill=0") == std::string::npos;
+}
+
+void saveFillSetting(bool fill)
+{
+    SDL_RWops* file = SDL_RWFromFile((storageDirectory() + "settings.cfg").c_str(), "wb");
+    if (!file)
+    {
+        return;
+    }
+    std::string text = fill ? "fill=1\n" : "fill=0\n";
+    SDL_RWwrite(file, text.data(), 1, text.size());
+    SDL_RWclose(file);
+}
+
+struct ScreenModeButton
+{
+    SDL_FRect rect = {0, 0, 0, 0};
+
+    void layout(int width, int height, float insetRight)
+    {
+        float unit = (float)std::min(width, height);
+        float size = unit * (kMobile ? 0.085f : 0.06f);
+        float margin = unit * 0.035f;
+        rect = {width - std::max(margin, insetRight) - size, margin, size, size};
+    }
+
+    bool contains(float x, float y) const
+    {
+        float pad = rect.w * 0.25f;
+        return x >= rect.x - pad && x <= rect.x + rect.w + pad && y >= rect.y - pad && y <= rect.y + rect.h + pad;
+    }
+
+    void draw(SDL_Renderer* renderer, bool fill) const
+    {
+        float cx = rect.x + rect.w * 0.5f;
+        float cy = rect.y + rect.h * 0.5f;
+        smb3::fillCircle(renderer, cx, cy, rect.w * 0.5f, {0, 0, 0, 150});
+        float half = rect.w * 0.24f;
+        float arm = rect.w * 0.14f;
+        float thick = std::max(2.0f, rect.w * 0.065f);
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 230);
+        for (int sx = -1; sx <= 1; sx += 2)
+        {
+            for (int sy = -1; sy <= 1; sy += 2)
+            {
+                float px;
+                float py;
+                float dx;
+                float dy;
+                if (fill)
+                {
+                    px = cx + sx * half * 0.3f;
+                    py = cy + sy * half * 0.3f;
+                    dx = (float)sx;
+                    dy = (float)sy;
+                }
+                else
+                {
+                    px = cx + sx * half;
+                    py = cy + sy * half;
+                    dx = (float)-sx;
+                    dy = (float)-sy;
+                }
+                SDL_FRect horizontal = {dx > 0 ? px : px - arm, py - thick * 0.5f, arm, thick};
+                SDL_FRect vertical = {px - thick * 0.5f, dy > 0 ? py : py - arm, thick, arm};
+                SDL_RenderFillRectF(renderer, &horizontal);
+                SDL_RenderFillRectF(renderer, &vertical);
+            }
+        }
+    }
+};
+
+SDL_Rect gameViewport(int width, int height, bool fill)
+{
+    if (fill)
+    {
+        return {0, 0, width, height};
+    }
+    const int sourceHeight = 224;
+    float scale = std::min(width / 256.0f, height / (float)sourceHeight);
+    if (!kMobile && scale >= 1.0f)
+    {
+        float integer = (float)(int)scale;
+        if (integer >= 1.0f && scale - integer < 0.15f)
+        {
+            scale = integer;
+        }
+    }
+    int w = (int)(256 * scale);
+    int h = (int)(sourceHeight * scale);
+    return {(width - w) / 2, (height - h) / 2, w, h};
+}
+}
+
+int main(int argc, char** argv)
+{
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+    SDL_SetHint(SDL_HINT_ANDROID_BLOCK_ON_PAUSE, "1");
+
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0)
+    {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Super Mario Bros. 3", SDL_GetError(), nullptr);
+        return 1;
+    }
+
+    Uint32 windowFlags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+    if (kMobile)
+    {
+        windowFlags |= SDL_WINDOW_FULLSCREEN;
+    }
+    SDL_Window* window = SDL_CreateWindow("Super Mario Bros. 3", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 256 * 3, 224 * 3, windowFlags);
+    if (!window)
+    {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Super Mario Bros. 3", SDL_GetError(), nullptr);
+        SDL_Quit();
+        return 1;
+    }
+    SDL_SetWindowMinimumSize(window, 256, 224);
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!renderer)
+    {
+        renderer = SDL_CreateRenderer(window, -1, 0);
+    }
+    if (!renderer)
+    {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Super Mario Bros. 3", SDL_GetError(), window);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, smb3::Ppu::kWidth, smb3::Ppu::kHeight);
+
+    smb3::AudioOutput audio;
+    smb3::Game game;
+    if (audio.open(kSampleRate, kMobile ? 1024 : 512, kMobile ? 3.0 : 2.0))
+    {
+        game.setSampleRate(audio.sampleRate());
+    }
+
+    smb3::FramePacer pacer;
+    pacer.setRefreshRate(displayRefreshRate(window));
+    PerformanceStats stats;
+    bool fillScreen = loadFillSetting();
+    ScreenModeButton modeButton;
+    double lastMouseTime = -1000.0;
+    bool cursorVisible = true;
+    auto toggleFill = [&]() {
+        fillScreen = !fillScreen;
+        saveFillSetting(fillScreen);
+    };
+
+    std::string status;
+    bool romLoaded = false;
+    for (const std::string& path : romCandidates(argc, argv))
+    {
+        if (!fileExists(path))
+        {
+            continue;
+        }
+        std::string error;
+        if (game.loadRom(path, error))
+        {
+            romLoaded = true;
+            break;
+        }
+        status = error;
+    }
+
+    Input input;
+    for (int i = 0; i < SDL_NumJoysticks(); i++)
+    {
+        input.open(i);
+    }
+
+    smb3::TouchControls touch;
+    touch.visible = kMobile;
+
+    std::vector<int16_t> audioBuffer(4096);
+    const double frequency = (double)SDL_GetPerformanceFrequency();
+    Uint64 previous = SDL_GetPerformanceCounter();
+    double clock = 0.0;
+    bool running = true;
+    bool paused = false;
+    bool userPaused = false;
+    bool pickerRequested = false;
+    bool textureStale = true;
+    int romPollTimer = 0;
+
+    if (!romLoaded && kMobile)
+    {
+        requestRomPicker(window);
+        pickerRequested = true;
+    }
+
+    while (running)
+    {
+        int outputWidth = 0;
+        int outputHeight = 0;
+        SDL_GetRendererOutputSize(renderer, &outputWidth, &outputHeight);
+        float insetLeft = 0.0f;
+        float insetRight = 0.0f;
+        float insetBottom = 0.0f;
+#if defined(__IPHONEOS__)
+        smb3::iosSafeAreaInsets(window, outputWidth, insetLeft, insetRight, insetBottom);
+#endif
+        touch.layout(outputWidth, outputHeight, insetLeft, insetRight, insetBottom);
+        modeButton.layout(outputWidth, outputHeight, insetRight);
+
+        SDL_Event event;
+        while (SDL_PollEvent(&event))
+        {
+            switch (event.type)
+            {
+            case SDL_QUIT:
+                running = false;
+                break;
+            case SDL_APP_WILLENTERBACKGROUND:
+            case SDL_APP_DIDENTERBACKGROUND:
+                paused = true;
+                audio.pause(true);
+                break;
+            case SDL_APP_DIDENTERFOREGROUND:
+                paused = false;
+                previous = SDL_GetPerformanceCounter();
+                pacer.reset();
+                audio.pause(false);
+                break;
+            case SDL_WINDOWEVENT:
+                if (event.window.event == SDL_WINDOWEVENT_MOVED || event.window.event == SDL_WINDOWEVENT_DISPLAY_CHANGED ||
+                    event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
+                {
+                    pacer.setRefreshRate(displayRefreshRate(window));
+                }
+                break;
+            case SDL_KEYDOWN:
+                if (event.key.repeat)
+                {
+                    break;
+                }
+                if (event.key.keysym.scancode == SDL_SCANCODE_ESCAPE && !kMobile)
+                {
+                    running = false;
+                }
+                else if (event.key.keysym.scancode == SDL_SCANCODE_F11 ||
+                         (event.key.keysym.scancode == SDL_SCANCODE_RETURN && (event.key.keysym.mod & KMOD_ALT)))
+                {
+                    bool fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
+                    SDL_SetWindowFullscreen(window, fullscreen ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+                }
+                else if (event.key.keysym.scancode == SDL_SCANCODE_F2)
+                {
+                    game.reset();
+                }
+                else if (event.key.keysym.scancode == SDL_SCANCODE_P)
+                {
+                    userPaused = !userPaused;
+                }
+                else if (event.key.keysym.scancode == SDL_SCANCODE_F3)
+                {
+                    stats.visible = !stats.visible;
+                }
+                else if (event.key.keysym.scancode == SDL_SCANCODE_F4)
+                {
+                    toggleFill();
+                }
+                touch.visible = false;
+                break;
+            case SDL_CONTROLLERDEVICEADDED:
+                input.open(event.cdevice.which);
+                break;
+            case SDL_CONTROLLERDEVICEREMOVED:
+                input.close(event.cdevice.which);
+                break;
+            case SDL_CONTROLLERBUTTONDOWN:
+                input.lastPadTime = clock;
+                if (kMobile)
+                {
+                    touch.visible = false;
+                }
+                break;
+            case SDL_MOUSEMOTION:
+                if (event.motion.which != SDL_TOUCH_MOUSEID)
+                {
+                    lastMouseTime = clock;
+                }
+                break;
+            case SDL_MOUSEBUTTONDOWN:
+                if (event.button.which != SDL_TOUCH_MOUSEID && event.button.button == SDL_BUTTON_LEFT && romLoaded)
+                {
+                    int windowWidth = 1;
+                    int windowHeight = 1;
+                    SDL_GetWindowSize(window, &windowWidth, &windowHeight);
+                    float mx = event.button.x * (float)outputWidth / std::max(1, windowWidth);
+                    float my = event.button.y * (float)outputHeight / std::max(1, windowHeight);
+                    lastMouseTime = clock;
+                    if (modeButton.contains(mx, my))
+                    {
+                        toggleFill();
+                    }
+                }
+                break;
+            case SDL_FINGERDOWN:
+                if (romLoaded && modeButton.contains(event.tfinger.x * outputWidth, event.tfinger.y * outputHeight))
+                {
+                    toggleFill();
+                    break;
+                }
+                touch.handleEvent(event, outputWidth, outputHeight);
+                touch.visible = true;
+                break;
+            case SDL_FINGERMOTION:
+            case SDL_FINGERUP:
+                touch.handleEvent(event, outputWidth, outputHeight);
+                break;
+            case SDL_DROPFILE:
+            {
+                std::string dropped = event.drop.file;
+                SDL_free(event.drop.file);
+                std::string error;
+                smb3::Game probe;
+                if (probe.loadRom(dropped, error))
+                {
+                    std::string target = storageDirectory() + kRomName;
+                    copyFile(dropped, target);
+                    std::string loadError;
+                    romLoaded = game.loadRom(dropped, loadError);
+                    status = romLoaded ? "" : loadError;
+                }
+                else
+                {
+                    status = error;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+
+        if (!romLoaded)
+        {
+            if (kMobile)
+            {
+                if (++romPollTimer >= 20)
+                {
+                    romPollTimer = 0;
+                    for (const std::string& path : romCandidates(1, argv))
+                    {
+                        if (!fileExists(path))
+                        {
+                            continue;
+                        }
+                        std::string error;
+                        romLoaded = game.loadRom(path, error);
+                        if (romLoaded)
+                        {
+                            break;
+                        }
+                        status = error;
+                        if (path == storageDirectory() + kRomName)
+                        {
+                            std::remove(path.c_str());
+                        }
+                    }
+                }
+                if (touch.tapped())
+                {
+                    requestRomPicker(window);
+                    pickerRequested = true;
+                }
+            }
+
+            SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+            SDL_RenderClear(renderer);
+            int scale = std::max(2, std::min(outputWidth, outputHeight) / 160);
+            SDL_Color white = {255, 255, 255, 255};
+            SDL_Color red = {255, 110, 110, 255};
+            std::string message = kMobile ? "TAP THE SCREEN TO SELECT YOUR SUPER MARIO BROS. 3 ROM (.NES)"
+                                          : "DRAG AND DROP YOUR SUPER MARIO BROS. 3 ROM (.NES) ONTO THIS WINDOW";
+            smb3::drawTextWrapped(renderer, message, outputWidth / 2, outputHeight / 2 - scale * 10, outputWidth * 8 / 10, scale, white);
+            if (!status.empty())
+            {
+                smb3::drawTextWrapped(renderer, status, outputWidth / 2, outputHeight / 2 + scale * 22, outputWidth * 8 / 10, std::max(1, scale / 2 + 1), red);
+            }
+            SDL_RenderPresent(renderer);
+            SDL_Delay(kMobile && pickerRequested ? 30 : 16);
+            previous = SDL_GetPerformanceCounter();
+            continue;
+        }
+
+        Uint64 now = SDL_GetPerformanceCounter();
+        double elapsed = (now - previous) / frequency;
+        previous = now;
+        clock += std::min(elapsed, 0.25);
+        bool active = !paused && !userPaused;
+        int frames = pacer.framesToRun(elapsed, active);
+
+        uint8_t keyboard = Input::readKeyboard();
+        uint8_t touchButtons = touch.buttons();
+        uint8_t pad1 = keyboard | touchButtons;
+        uint8_t pad2 = 0;
+        if (!input.controllers.empty())
+        {
+            pad1 |= Input::readController(input.controllers[0]);
+        }
+        if (input.controllers.size() > 1)
+        {
+            pad2 = Input::readController(input.controllers[1]);
+        }
+        else
+        {
+            pad2 = pad1;
+        }
+
+        Uint64 workStart = SDL_GetPerformanceCounter();
+        for (int i = 0; i < frames; i++)
+        {
+            game.runFrame(pad1, pad2);
+            if (audio.isOpen())
+            {
+                int count = game.produceAudio(audioBuffer.data(), (int)audioBuffer.size(), audio.rateAdjust());
+                audio.submit(audioBuffer.data(), count);
+            }
+        }
+        double work = (SDL_GetPerformanceCounter() - workStart) / frequency;
+        stats.update(std::min(elapsed, 0.25), frames, work);
+
+        if (frames > 0 || textureStale)
+        {
+            SDL_UpdateTexture(texture, nullptr, game.framebuffer(), smb3::Ppu::kWidth * sizeof(uint32_t));
+            textureStale = false;
+        }
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+        SDL_Rect source = {0, 8, 256, 224};
+        SDL_Rect target = gameViewport(outputWidth, outputHeight, fillScreen);
+        SDL_RenderCopy(renderer, texture, &source, &target);
+        if (game.faulted())
+        {
+            int scale = std::max(2, std::min(outputWidth, outputHeight) / 200);
+            smb3::drawTextWrapped(renderer, game.faultMessage() + "\nPRESS F2 OR START TO RESET", outputWidth / 2, outputHeight / 2, outputWidth * 8 / 10, scale, {255, 110, 110, 255});
+            if (pad1 & smb3::ButtonStart)
+            {
+                game.reset();
+            }
+        }
+        if (userPaused)
+        {
+            int scale = std::max(2, std::min(outputWidth, outputHeight) / 160);
+            smb3::drawText(renderer, "PAUSED", outputWidth / 2, outputHeight / 2 - scale * 3, scale, {255, 255, 255, 255}, true);
+        }
+        if (clock - input.lastPadTime > 5.0 || !kMobile)
+        {
+            touch.draw(renderer, fillScreen ? 0.6f : 1.0f);
+        }
+        bool mouseActive = clock - lastMouseTime < 2.5;
+        if (kMobile || mouseActive)
+        {
+            modeButton.draw(renderer, fillScreen);
+        }
+        bool wantCursor = kMobile || mouseActive;
+        if (!kMobile && wantCursor != cursorVisible)
+        {
+            SDL_ShowCursor(wantCursor ? SDL_ENABLE : SDL_DISABLE);
+            cursorVisible = wantCursor;
+        }
+        stats.draw(renderer, pacer, audio, outputHeight);
+        SDL_RenderPresent(renderer);
+        if (frames == 0 && !pacer.locked())
+        {
+            SDL_Delay(1);
+        }
+    }
+
+    for (SDL_GameController* controller : input.controllers)
+    {
+        SDL_GameControllerClose(controller);
+    }
+    audio.close();
+    SDL_DestroyTexture(texture);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return 0;
+}

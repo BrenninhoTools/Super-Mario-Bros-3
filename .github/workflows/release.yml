@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (tag), e.g. v1.0.0"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        type: boolean
+        default: false
+      draft:
+        description: "Create as draft"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ inputs.version }}
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package files
+        run: |
+          VERSION="${{ inputs.version }}"
+          mkdir -p release
+          cp artifacts/SuperMarioBros3-Android/*.apk "release/SuperMarioBros3-$VERSION-Android.apk"
+          (cd artifacts/SuperMarioBros3-Windows && zip -9 "../../release/SuperMarioBros3-$VERSION-Windows.zip" SuperMarioBros3.exe)
+          chmod +x artifacts/SuperMarioBros3-Linux/SuperMarioBros3
+          tar -C artifacts/SuperMarioBros3-Linux -czf "release/SuperMarioBros3-$VERSION-Linux.tar.gz" SuperMarioBros3
+          cp artifacts/SuperMarioBros3-macOS/SuperMarioBros3-macOS.zip "release/SuperMarioBros3-$VERSION-macOS.zip"
+          cp artifacts/SuperMarioBros3-iOS/SuperMarioBros3-iOS.ipa "release/SuperMarioBros3-$VERSION-iOS.ipa"
+          (cd release && sha256sum * > SHA256SUMS.txt)
+          ls -la release
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: Super Mario Bros. 3 ${{ inputs.version }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ inputs.prerelease }}
+          draft: ${{ inputs.draft }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release/*
+          body: |
+            Native C++ port of Super Mario Bros. 3 for Android, iOS, Windows, macOS and Linux.
+
+            A ROM is required and is not included: **Super Mario Bros. 3 (USA) (Rev 1)**.
+
+            | File | Platform |
+            |------|----------|
+            | `SuperMarioBros3-${{ inputs.version }}-Android.apk` | Android 8.0+ (arm64-v8a) |
+            | `SuperMarioBros3-${{ inputs.version }}-Windows.zip` | Windows x64 |
+            | `SuperMarioBros3-${{ inputs.version }}-Linux.tar.gz` | Linux x64 |
+            | `SuperMarioBros3-${{ inputs.version }}-macOS.zip` | macOS 10.13+ (Apple Silicon and Intel) |
+            | `SuperMarioBros3-${{ inputs.version }}-iOS.ipa` | iOS 14+ (unsigned, sideload with AltStore, SideStore or TrollStore) |
